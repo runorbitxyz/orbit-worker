@@ -1,0 +1,43 @@
+name: Release
+
+# Tag vX.Y.Z (matching VERSION in orbit_worker.py) to publish a release: the worker, the installers and SHA256SUMS,
+# with build provenance signed by GitHub Actions (check with: gh attestation verify orbit_worker.py --repo <this repo>).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: The tag matches the worker's version
+        run: |
+          version="$(sed -n 's/^VERSION = "orbit-worker\/\(.*\)"$/\1/p' orbit_worker.py)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but orbit_worker.py says $version"; exit 1; }
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Security tests
+        run: pip install pytest && python -m pytest -q tests/test_worker_security.py
+      - name: Checksums
+        run: |
+          mkdir dist
+          cp orbit_worker.py install.sh install.ps1 dist/
+          (cd dist && sha256sum orbit_worker.py install.sh install.ps1 > SHA256SUMS && cat SHA256SUMS)
+      - name: Sign build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/orbit_worker.py dist/install.sh dist/install.ps1 dist/SHA256SUMS \
+            --title "orbit-worker ${GITHUB_REF_NAME#v}" \
+            --notes "Check what you run: \`sha256sum orbit_worker.py\` against SHA256SUMS, or \`gh attestation verify orbit_worker.py --repo $GITHUB_REPOSITORY\`."
