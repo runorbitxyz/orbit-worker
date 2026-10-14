@@ -85,7 +85,7 @@ restarts it if it dies.
   default). Bigger models earn more per token. Earnings are paid in $ORBIT to the wallet you link, in regular
   batches.
 - **Bonds.** Rigs serving bigger models (medium tier and up) stake $ORBIT from their payout wallet to earn from paid
-  traffic.
+  traffic, a bond for each public rig the wallet is paid for.
 - **Checks.** Rigs get unannounced test questions with known answers, harder for bigger models. Wrong answers lower a
   rig's reputation, and with it how much work it gets, and cost part of its bond.
 - **Private rigs** serve only you, for free. Nobody else's requests ever reach them.

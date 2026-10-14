@@ -66,7 +66,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "orbit-worker/0.4.0"
+VERSION = "orbit-worker/0.4.1"
 DEFAULT_ORBIT_URL = "https://api.runorbit.xyz"  # the public ORBIT network
 log = logging.getLogger("orbit-worker")
 
@@ -121,7 +121,10 @@ def request_json(method: str, url: str, body: Optional[dict] = None, headers: Op
         raise HttpError(exc.code, exc.read(2000).decode(errors="replace")) from None
     if len(raw) > MAX_REPLY_BYTES:
         raise ValueError(f"reply larger than {MAX_REPLY_BYTES // 2**20} MB")
-    return json.loads(raw) if raw else None
+    try:
+        return json.loads(raw) if raw else None
+    except RecursionError:  # nested deeper than Python's parser goes: as invalid as any other bad reply
+        raise ValueError("reply nested too deeply") from None
 
 
 def printable(value: Any, limit: int = 200) -> str:
@@ -298,6 +301,15 @@ def pair(orbit_url: str, models: list[str], upstream: str, visibility: Optional[
 SERVICE_LABEL = "chain.orbit.worker"
 
 
+def _service_names() -> tuple[str, str, str]:
+    """(systemd unit, launchd label, Windows Startup item) for the background service. ORBIT_SERVICE_NAME gives a
+    second, separately named service (tests use it so they never touch a real install)."""
+    name = os.environ.get("ORBIT_SERVICE_NAME", "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name) or name == "orbit-worker":
+        return "orbit-worker", SERVICE_LABEL, "ORBIT Worker"
+    return name, f"chain.orbit.{name}", f"ORBIT {name}"
+
+
 def _service_args(script: Path, python: str) -> list[str]:
     """How the service starts the worker; everything else comes from the saved settings in --home."""
     return [python, str(script), "--home", str(home()), "--log-file", str(home() / "worker.log")]
@@ -323,38 +335,39 @@ def install_service(script: Path, python: str) -> str:
     Linux, a launchd agent on macOS, and a Startup shortcut (running supervise()) on Windows."""
     args = _service_args(script, python)
     system = platform.system()
+    unit_name, label, item = _service_names()
     if system == "Linux":
         if not shutil.which("systemctl"):
             raise SystemExit("systemd was not found; run the worker under your own supervisor (e.g. tmux or supervisord).")
-        unit = Path.home() / ".config" / "systemd" / "user" / "orbit-worker.service"
+        unit = Path.home() / ".config" / "systemd" / "user" / f"{unit_name}.service"
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text("[Unit]\nDescription=ORBIT compute worker\nAfter=network-online.target\nWants=network-online.target\n\n"
                         f"[Service]\nExecStart={' '.join(_systemd_quote(a) for a in args)}\nRestart=always\nRestartSec=10\n"
                         "Environment=PYTHONUNBUFFERED=1\nNoNewPrivileges=yes\n\n[Install]\nWantedBy=default.target\n")
         _check(["systemctl", "--user", "daemon-reload"], "reload systemd (is a user session running?)")
-        _check(["systemctl", "--user", "enable", "--now", "orbit-worker"], "start the orbit-worker service")
+        _check(["systemctl", "--user", "enable", "--now", unit_name], f"start the {unit_name} service")
         _run(["loginctl", "enable-linger", os.environ.get("USER", "")])  # keep running after logout, where allowed
-        return "systemd user service 'orbit-worker' (logs: journalctl --user -u orbit-worker -f)"
+        return f"systemd user service '{unit_name}' (logs: journalctl --user -u {unit_name} -f)"
     if system == "Darwin":
         import plistlib
 
-        plist = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
         plist.parent.mkdir(parents=True, exist_ok=True)
         logfile = str(home() / "worker.log")
         plist.write_bytes(plistlib.dumps({
-            "Label": SERVICE_LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": True,
+            "Label": label, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": True,
             "ThrottleInterval": 10, "StandardOutPath": logfile, "StandardErrorPath": logfile,
             "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"}}))
         subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
         _check(["launchctl", "load", "-w", str(plist)], "load the launchd agent")
-        return f"launchd agent '{SERVICE_LABEL}' (logs: tail -f {logfile})"
+        return f"launchd agent '{label}' (logs: tail -f {logfile})"
     if system == "Windows":
         # Windows has no per-user service manager that restarts a crashed program, so the Startup shortcut runs
         # supervise(), which does.
         args = [*args, "--supervise"]
         pythonw = Path(python).with_name("pythonw.exe")
         exe = str(pythonw if pythonw.exists() else python)
-        shortcut = _windows_startup() / "ORBIT Worker.lnk"
+        shortcut = _windows_startup() / f"{item}.lnk"
         shortcut.parent.mkdir(parents=True, exist_ok=True)
         quote = lambda v: v.replace("'", "''")  # noqa: E731  (PowerShell single-quoted string)
         arguments = " ".join(f'"{a}"' for a in args[1:])
@@ -366,7 +379,7 @@ def install_service(script: Path, python: str) -> str:
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.Popen([exe, *args[1:]], creationflags=flags, close_fds=True,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return f"Startup item 'ORBIT Worker' (runs at login; logs: {home() / 'worker.log'})"
+        return f"Startup item '{item}' (runs at login; logs: {home() / 'worker.log'})"
     raise SystemExit("No supported service manager found; run the worker in a terminal or under your own supervisor.")
 
 
@@ -406,11 +419,12 @@ def supervise(child_args: list[str]) -> int:
 
 
 def uninstall_service() -> str:
-    unit = Path.home() / ".config" / "systemd" / "user" / "orbit-worker.service"
-    plist = Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
-    shortcut = _windows_startup() / "ORBIT Worker.lnk"
+    unit_name, label, item = _service_names()
+    unit = Path.home() / ".config" / "systemd" / "user" / f"{unit_name}.service"
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    shortcut = _windows_startup() / f"{item}.lnk"
     if unit.exists():
-        subprocess.run(["systemctl", "--user", "disable", "--now", "orbit-worker"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "disable", "--now", unit_name], capture_output=True)
         unit.unlink()
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         return "Removed the systemd user service."
@@ -483,6 +497,8 @@ class Worker:
                 log.warning("heartbeat failed: %s", exc)
             except (OSError, ValueError) as exc:
                 log.warning("heartbeat failed (is your model server running at %s?): %s", self.upstream, exc)
+            except Exception as exc:  # never let one bad reply stop the heartbeat: the rig would look offline
+                log.warning("heartbeat failed unexpectedly: %s", printable(repr(exc)))
             stop.wait(self.heartbeat_every)
 
     # --- jobs ----------------------------------------------------------------------------------------
@@ -579,6 +595,10 @@ class Worker:
                 backoff = min(backoff * 2, 60)
             except (OSError, ValueError) as exc:
                 log.warning("connection problem: %s (retrying in %.0fs)", printable(exc), backoff)
+                stop.wait(backoff)
+                backoff = min(backoff * 2, 60)
+            except Exception as exc:  # a job slot that dies would leave the rig serving fewer jobs, or none
+                log.warning("unexpected error: %s (retrying in %.0fs)", printable(repr(exc)), backoff)
                 stop.wait(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -707,6 +727,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     finally:
         if pidfile is not None:
             pidfile.unlink(missing_ok=True)
+    if not stop.is_set():  # the worker stopped on its own: exit with an error, so the background service restarts it
+        log.error("the worker stopped unexpectedly")
+        return 1
     return 0
 
 

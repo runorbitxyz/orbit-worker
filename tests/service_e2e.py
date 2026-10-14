@@ -169,7 +169,8 @@ def main() -> int:
     p.add_argument("--home", help="scratch HOME for the test (default: the real one)")
     p.add_argument("--only", choices=["supervisor", "direct", "installer"])
     args = p.parse_args()
-    env = dict(os.environ)
+    # A service of its own name, so a real ORBIT worker installed on this machine is never replaced or removed.
+    env = dict(os.environ, ORBIT_SERVICE_NAME="orbit-worker-e2e")
     scratch = Path(args.home or tempfile.mkdtemp(prefix="orbit-svc-"))
     if args.home:
         scratch.mkdir(parents=True, exist_ok=True)

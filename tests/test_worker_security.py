@@ -220,3 +220,28 @@ def test_pairing_sends_neither_the_machine_name_nor_the_model_server_address(mon
 def test_the_default_server_is_the_public_network_over_https():
     assert orbit_worker.DEFAULT_ORBIT_URL == "https://api.runorbit.xyz"
     assert check_orbit_url(orbit_worker.DEFAULT_ORBIT_URL) == orbit_worker.DEFAULT_ORBIT_URL
+
+
+def test_a_reply_nested_too_deeply_is_invalid_not_fatal(servers):
+    orbit, model = servers
+    model.routes["/v1/chat/completions"] = (200, b"[" * 200_000 + b"]" * 200_000, {})
+    worker_for(orbit, model).run_job(job())
+    assert orbit.requests[-1]["body"] == {"error": "model server returned an invalid reply"}
+
+
+def test_job_slots_survive_unexpected_errors(servers):
+    orbit, model = servers
+    orbit.routes["/api/network/worker/poll"] = (200, b"[" * 200_000 + b"]" * 200_000, {})
+    stop = threading.Event()
+    w = worker_for(orbit, model, poll_wait=0)
+    w._connected = True
+    w.run_job = lambda _job: (_ for _ in ()).throw(RuntimeError("boom"))
+    t = threading.Thread(target=w.job_loop, args=(stop,), daemon=True)
+    t.start()
+    t.join(1.5)
+    assert t.is_alive()  # a bad reply (or a bug) is retried with backoff, never the end of the job slot
+    orbit.routes["/api/network/worker/poll"] = (200, {"job": job()}, {})
+    t.join(2.5)
+    assert t.is_alive()
+    stop.set()
+    t.join(5)
